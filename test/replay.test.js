@@ -407,3 +407,101 @@ test('Worker 端到端：分批结果与主线程一致，旧代次响应不得�
 
   await worker.terminate();
 });
+
+// ---------------------------------------------------------------- UI 协议层：在途追加定位与同版本导出
+// index.html 的客户端必须遵守两条契约（教学演示中分批追加 + 未等重放落定就继续编辑/导出）：
+//   1. 追加基准只能取“期望日志长度”（同步镜像），不能取尚未落定的 result.length，
+//      否则连续追加时后一批落回错误 tick（覆盖前段、缩短长度，形成意外空档）；
+//   2. 导出必须等待在途代次全部落定，使 commands 与 frames 同版本，
+//      否则导出“旧帧 + 新指令”，重新导入重放后与导出时所见不一致。
+test('客户端契约：在途连续追加按期望长度定位；导出等待落定后与重放一致', async (t) => {
+  const worker = new Worker(path.join(__dirname, '..', 'replay-worker.js'));
+  await new Promise((res, rej) => {
+    worker.once('online', res);
+    worker.once('error', rej);
+  });
+  const client = C.createReplayClient((m) => worker.postMessage(m));
+  let pending = 0;
+  const idleResolvers = [];
+  worker.on('message', (m) => {
+    client.accept(m);
+    pending = Math.max(0, pending - 1);
+    if (pending === 0) idleResolvers.splice(0).forEach((r) => r());
+  });
+  const whenIdle = async () => {
+    while (pending > 0) await new Promise((r) => idleResolvers.push(r));
+  };
+  let mirror = []; // UI 的同步期望指令日志
+  const sendReset = (slots, n) => {
+    mirror = slots.slice(0, n).map((s) => (s ? Object.assign({}, s) : null));
+    pending++; client.reset(entriesOf(mirror), n);
+  };
+  // 模拟 UI 追加：base 取期望长度（修复后行为）
+  const appendByWantedLength = (pairs) => {
+    const base = mirror.length;
+    const edits = pairs.map(([a, b], i) => {
+      mirror[base + i] = { a, b };
+      return { tick: base + i, a, b };
+    });
+    pending++; client.patch(edits, base + pairs.length);
+  };
+  // 错误对照：base 取尚未落定的 result.length（修复前行为）
+  const appendByStaleResultLength = (pairs) => {
+    const base = client.result.length;
+    const edits = pairs.map(([a, b], i) => {
+      mirror[base + i] = { a, b };
+      return { tick: base + i, a, b };
+    });
+    pending++; client.patch(edits, base + pairs.length);
+  };
+
+  await t.test('修复前基准：在途短批次落回旧 tick，覆盖前段并缩短（意外空档）', async () => {
+    sendReset(Array.from({ length: 14 }, () => ({ a: 'right', b: 'left' })), 14);
+    await whenIdle();
+    appendByStaleResultLength(Array.from({ length: 10 }, () => ['up', 'down'])); // 14..23 在途
+    appendByStaleResultLength(Array.from({ length: 5 }, () => ['left', 'up']));  // 基准仍=14
+    await whenIdle();
+    assert.equal(client.result.length, 19, '第二批覆盖 tick14..18，长度缩回 19，19..23 丢失');
+    for (let t = 15; t <= 19; t++) {
+      const f = client.result.frames[t];
+      assert.deepEqual(f.a, C.stepFrame(client.result.frames[t - 1], 'left', 'up').a);
+    }
+  });
+
+  await t.test('修复后基准：连续在途追加顺序落位，无错位无空档', async () => {
+    sendReset(Array.from({ length: 14 }, () => ({ a: 'right', b: 'left' })), 14);
+    await whenIdle();
+    appendByWantedLength(Array.from({ length: 10 }, () => ['up', 'down']));
+    appendByWantedLength(Array.from({ length: 5 }, () => ['left', 'up']));
+    await whenIdle();
+    const slots = mirror;
+    assert.equal(client.result.length, 29);
+    assert.deepEqual(client.result, full(slots, 29));
+    for (let i = 14; i < 24; i++) assert.deepEqual(slots[i], { a: 'up', b: 'down' });
+    for (let i = 24; i < 29; i++) assert.deepEqual(slots[i], { a: 'left', b: 'up' });
+  });
+
+  await t.test('在途编辑过去 tick 时导出：等落定后 frames 与按 commands 重放逐帧一致', async () => {
+    sendReset(Array.from({ length: 14 }, (_, i) => ({
+      a: i < 7 ? 'right' : 'stay', b: 'left'
+    })), 14);
+    await whenIdle();
+    const beforeTick3 = JSON.parse(JSON.stringify(client.result.frames[3]));
+    // 改过去 tick，不等待落定
+    mirror[2] = { a: 'down', b: 'down' };
+    pending++; client.patch([{ tick: 2, a: 'down', b: 'down' }], mirror.length);
+    // 模拟“立即导出（不等）”拿到的是旧帧
+    const premature = client.result.frames;
+    assert.deepEqual(premature[3], beforeTick3, '在途期间帧仍是改前版本');
+    // 正确做法：等待全部代次落定再导出
+    await whenIdle();
+    const exported = { commands: mirror.slice(), frames: client.result.frames, length: client.result.length };
+    assert.equal(exported.length, 14);
+    const reimported = full(exported.commands, exported.length); // 导入后重新重放验证
+    assert.deepEqual(reimported.frames, exported.frames,
+      '导出包的 frames 必须等于按其 commands 的重放结果');
+    assert.notDeepEqual(exported.frames[3], beforeTick3, '落定帧确实已按新指令重算');
+  });
+
+  await worker.terminate();
+});

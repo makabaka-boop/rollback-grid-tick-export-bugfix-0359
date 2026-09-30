@@ -46,6 +46,19 @@ npx http-server .          # 或 python3 -m http.server
 - **播放、单步、跳转、导出读取的是同一份重放结果**（客户端持有的 `result.frames`）。
 - 导出 JSON 含 `commands` 与全部 `frames`，可再次导入；导入后由 Worker 重新重放验证，而不是信任文件里的帧。
 
+### 在途编辑（重放尚未完成就继续操作）
+
+教学演示中常见“指令分批追加、Worker 还没算完就点下一批/导出”，页面遵循两条契约：
+
+1. **追加定位只认期望日志长度**：UI 同步维护期望指令镜像 `cmds`，追加（DSL 追加、随机 10 tick、
+   编辑器提交）的基准 tick 一律取 `cmds.length`，**绝不取尚未落定的 `result.length`**。
+   否则第一批 patch 在途时连点追加，后一批会落回旧 tick，覆盖前批尾部并把长度缩短，形成意外空档。
+2. **导出等待全部在途代次落定**：导出按钮在有在途代次时锁定（状态栏显示“重放计算中”），
+   点击处理也会 await 到空闲，并校验 `commands.length === frames.length-1`。
+   因此导出包不可能是“新指令 + 旧帧”的混合版本，刷新页面按存档重放与导出时所见逐帧一致。
+   `localStorage` 存档同样在每次发出编辑后立即写入**期望日志**（崩溃/关闭也不丢批次），
+   重放错误（理论上 UI 不构造非法请求）时回滚到最近已落定快照并重新锚定 Worker。
+
 ## 操作
 
 - 播放/暂停（空格）、单步（←/→）、首末帧（Home/End）、跳转到任意 tick、变速 2–20 tick/秒；
@@ -61,7 +74,7 @@ npx http-server .          # 或 python3 -m http.server
 | `replay-core.js` | UMD 零依赖内核：棋盘/裁决纯函数、有状态 `Replayer`（检查点重放）、`serveWorker`、`createReplayClient`（代次守卫）。浏览器/Worker/Node 共用同一份权威实现 |
 | `replay-worker.js` | Worker 入口（Node `worker_threads` 与浏览器 hosted Worker 双用） |
 | `index.html` | 单文件页面；Blob 内联内核启动 Worker，主线程计算兜底 |
-| `test/replay.test.js` | node:test 套件（17 个用例，含真实 Worker 线程） |
+| `test/replay.test.js` | node:test 套件（含真实 Worker 线程；覆盖在途连续追加错位与跨版本导出回归） |
 
 ## 测试
 

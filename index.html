@@ -117,7 +117,7 @@
       <div class="row">
         <label class="lab">Tick</label>
         <button id="ePrevT">−</button>
-        <input type="number" id="eTick" min="0" value="0">
+        <input type="number" id="eTick" min="0" max="299" value="0">
         <button id="eNextT">+</button>
         <span id="eTickHint" class="hint"></span>
       </div>
@@ -166,7 +166,7 @@
     <div class="panel">
       <h2>导入 / 导出 JSON</h2>
       <div class="row" style="margin:0">
-        <button id="bExport" class="primary">导出完整重放结果（含逐帧状态）</button>
+        <button id="bExport" class="primary" title="重放在途时自动锁定，落定后才可导出，保证 commands 与 frames 同版本">导出完整重放结果（含逐帧状态）</button>
         <label class="lab" style="min-width:auto">
           <input type="file" id="fileImport" accept=".json,application/json" hidden>
           <button id="bImport">从 JSON 导入</button>
@@ -228,18 +228,57 @@
 
   const worker = createWorker();
   const client = C.createReplayClient((m) => worker.postMessage(m));
-  worker.addEventListener('message', (ev) => {
-    const m = ev.data;
-    if (m.type === 'error') { client.accept(m); alert('重放错误：' + m.message); return; }
-    if (client.accept(m)) onResult();
-  });
+
+  // ---------- 在途代次跟踪 ----------
+  // 一次 reset/patch 发出后到 Worker 回复前为“在途”：此时 cmds 是期望日志（同步更新），
+  // client.result.frames 仍是上一已落定版本。所有追加定位只准用 cmds.length，
+  // 绝不能用尚未落定的 result.length，否则连续追加时后一批会落在错误 tick 上形成空档。
+  let pending = 0;               // 已发出但尚未收到回复的代次数
+  const idleResolvers = [];
+  function requestStarted() { pending++; updateExportLock(); updateStatus(); }
+  function requestFinished() {
+    pending = Math.max(0, pending - 1);
+    if (pending === 0) idleResolvers.splice(0).forEach((r) => r());
+    updateExportLock();
+  }
+  async function whenIdle() {
+    while (pending > 0) await new Promise((r) => idleResolvers.push(r));
+  }
+  function updateExportLock() { $('bExport').disabled = pending > 0; }
 
   // ---------- 本地状态 ----------
   const LS_KEY = 'gridReplay.v1';
-  let cmds = [];                 // 镜像指令：cmds[t] = {a?,b?}，缺省=停留
+  let cmds = [];                 // 期望指令日志（同步更新）：cmds[t] = {a?,b?}|null，缺省=停留
+  let settledCmds = [];          // 与最新“已接受代次”的 result 一致的指令快照（错误回滚用）
   let cursor = 0;                // 当前查看的 tick
   let editTick = 0;
   let playing = false, playTimer = null;
+
+  worker.addEventListener('message', (ev) => {
+    const m = ev.data;
+    if (m.type === 'error') {
+      client.accept(m);
+      requestFinished();
+      // UI 不会构造非法请求，这是防御路径：仅最新一代失败需要回滚期望日志，
+      // 并用已落定日志 reset 重新锚定 Worker（失败的 patch 本就不会改动 Worker 状态）。
+      if (m.gen === client.lastSentGen) {
+        alert('重放错误：' + m.message + '\n本次未生效的编辑已撤销。');
+        cmds = settledCmds.slice();
+        persist(); renderAll();
+        client.reset(entriesOf(cmds), cmds.length);
+        requestStarted();
+      }
+      updateStatus();
+      return;
+    }
+    const accepted = client.accept(m);
+    requestFinished();
+    if (accepted) {
+      settledCmds = cmds.slice(0, client.result.length);
+      onResult();
+    }
+    updateStatus();
+  });
 
   const demoCommands = (function () {
     const s = (a, b) => ({ a: a, b: b });
@@ -260,16 +299,26 @@
     cmds = [];
     for (let t = 0; t < length; t++) cmds[t] = list[t] ? Object.assign({}, list[t]) : null;
     stopPlay();
+    requestStarted();
     client.reset(entriesOf(cmds), length);
+    persist(); // 立刻持久化期望日志，即使 Worker 回复未到就关闭页面也不丢批次
   }
 
   function persist() {
     try {
       localStorage.setItem(LS_KEY, JSON.stringify({
-        commands: cmds.slice(0, client.result.length),
-        length: client.result.length
+        commands: cmds.slice(0, cmds.length),
+        length: cmds.length
       }));
     } catch (e) { /* 隐私模式等：忽略 */ }
+  }
+
+  function updateStatus() {
+    $('status').textContent =
+      worker.kind + ' · 代次 gen=' + client.gen +
+      (pending > 0 ? ' · ⏳ 重放计算中（' + pending + ' 代次在途，导出已锁定）' : ' · 已同步') +
+      ' · 已丢弃旧代次响应 ' + client.dropped + ' 次' +
+      ' · 日志 ' + cmds.length + '/' + C.MAX_TICKS + ' tick（已落定 ' + client.result.length + '）';
   }
 
   function onResult() {
@@ -277,9 +326,6 @@
     if (cursor > len) cursor = len;
     if (editTick > len) editTick = Math.max(0, len);
     if (playing && cursor >= len) stopPlay();
-    $('status').textContent =
-      worker.kind + ' · 代次 gen=' + client.gen +
-      ' · 已丢弃旧代次响应 ' + client.dropped + ' 次 · 日志 ' + len + '/' + C.MAX_TICKS + ' tick';
     $('eLen').value = len;
     renderAll();
     persist();
@@ -337,9 +383,10 @@
     $('fPosA').textContent = '(' + f.a.x + ',' + f.a.y + ')';
     $('fPosB').textContent = '(' + f.b.x + ',' + f.b.y + ')';
     $('fEvents').innerHTML = eventHtml(f);
-    // 产生该帧的指令
+    // 产生该帧的指令；画面显示的是已落定帧，指令同样取自已落定快照
+    // （在途批次可能已改了 cmds 但帧尚未重算）
     if (f.tick > 0) {
-      const c0 = cmds[f.tick - 1];
+      const c0 = settledCmds[f.tick - 1];
       $('fCmd').textContent = '本 tick 指令：A ' +
         C.DIR_CN[(c0 && c0.a) || 'stay'] + ' / B ' + C.DIR_CN[(c0 && c0.b) || 'stay'];
     } else $('fCmd').textContent = '（初始帧）';
@@ -432,16 +479,21 @@
   }
 
   function renderEditor() {
-    const len = client.result.length;
+    const len = cmds.length; // 期望日志长度，允许立刻编辑在途批次新增的 tick
+    const settledLen = client.result.length;
     $('eTick').value = editTick;
-    $('eTickHint').textContent =
-      editTick >= len
-        ? (editTick >= C.MAX_TICKS ? '已达 300 tick 上限' : '（提交将追加为新 tick）')
-        : '（改动将从 tick ' + (Math.floor(editTick / 10) * 10) + ' 检查点重放）';
+    let hint;
+    if (editTick >= C.MAX_TICKS) hint = '已达 300 tick 上限';
+    else if (editTick >= len) hint = '（提交将追加为新 tick）';
+    else hint = '（改动将从 tick ' + (Math.floor(editTick / 10) * 10) + ' 检查点重放）';
+    if (pending > 0 && editTick >= settledLen) {
+      hint += ' · 该 tick 属于在途批次，重放落定后画面同步';
+    }
+    $('eTickHint').textContent = hint;
     const c0 = cmds[editTick];
     $('eA').value = (c0 && c0.a) || 'stay';
     $('eB').value = (c0 && c0.b) || 'stay';
-    $('jumpTo').max = len; $('jumpTo').value = cursor;
+    $('jumpTo').max = settledLen; $('jumpTo').value = cursor;
   }
 
   function renderAll() {
@@ -482,8 +534,8 @@
 
   // ---------- 编辑器 ----------
   function commitTick(clear) {
-    const len = client.result.length;
-    const t = Math.min(editTick, C.MAX_TICKS);
+    const len = cmds.length; // 期望长度（含在途批次），不能用尚未落定的 result.length
+    const t = Math.min(editTick, C.MAX_TICKS - 1);
     const newLen = Math.max(len, t + 1);
     const edit = { tick: t };
     if (clear) { edit.a = null; edit.b = null; cmds[t] = null; }
@@ -492,7 +544,9 @@
       cmds[t] = { a: edit.a, b: edit.b };
     }
     stopPlay();
+    requestStarted();
     client.patch([edit], newLen);
+    persist();
   }
   $('eCommit').addEventListener('click', () => commitTick(false));
   $('eClear').addEventListener('click', () => commitTick(true));
@@ -500,21 +554,23 @@
     editTick = Math.max(0, editTick - 1); renderEditor(); renderTimeline();
   });
   $('eNextT').addEventListener('click', () => {
-    editTick = Math.min(C.MAX_TICKS, Math.min(client.result.length, editTick + 1));
+    editTick = Math.min(C.MAX_TICKS - 1, Math.min(cmds.length, editTick + 1));
     renderEditor(); renderTimeline();
   });
   $('eTick').addEventListener('change', () => {
-    editTick = Math.max(0, Math.min(C.MAX_TICKS, Number($('eTick').value) || 0));
+    editTick = Math.max(0, Math.min(C.MAX_TICKS - 1, Number($('eTick').value) || 0));
     renderEditor(); renderTimeline();
   });
   $('eSetLen').addEventListener('click', () => {
     const n = Math.max(0, Math.min(C.MAX_TICKS, Number($('eLen').value) || 0));
-    cmds.length = n;
+    cmds.length = n; // 延长产生的空槽读为 null（缺省=停留）；缩短丢弃尾部指令
     stopPlay();
+    requestStarted();
     client.patch([], n);
+    persist();
   });
   $('eRand10').addEventListener('click', () => {
-    const len = client.result.length;
+    const len = cmds.length; // 期望长度：在途批次尚未落定时也要接在它们之后
     if (len >= C.MAX_TICKS) return;
     const rnd = C.mulberry32((Date.now() >>> 0) ^ len);
     const dirs = C.DIR_NAMES;
@@ -525,7 +581,9 @@
       cmds[len + i] = { a: edits[i].a, b: edits[i].b };
     }
     stopPlay();
+    requestStarted();
     client.patch(edits, len + n);
+    persist();
   });
 
   // ---------- DSL / JSON 导入导出 ----------
@@ -573,17 +631,28 @@
       const { entries, length } = parseDsl($('dsl').value);
       let list, total;
       if (append) {
+        // 整段接在“期望日志”之后（含已发出但 Worker 尚未落定的在途批次）。
+        // 段内若使用绝对 tick（如 3:aR,bU），按相对当前末尾的偏移定位，
+        // 段内空档/乱序是 DSL 作者显式指定的；若改取 result.length，
+        // 重放未完成时连续追加，后一批会覆盖前一批尾部，产生意外空档。
+        const base = cmds.length;
         list = cmds.slice();
-        total = client.result.length;
+        total = base;
         for (const e of entries) {
-          const t = total + e.tick;
-          if (t >= C.MAX_TICKS) break;
+          const t = base + e.tick;
+          if (t >= C.MAX_TICKS) {
+            alert('追加位置超过 300 tick 上限，超出部分已忽略');
+            break;
+          }
           list[t] = { a: e.a, b: e.b };
           total = Math.max(total, t + 1);
         }
+        // 保证 list 是稠密数组（空槽 = 该 tick 缺省停留）
+        for (let t = 0; t < total; t++) if (!list[t]) list[t] = null;
       } else {
         list = new Array(length);
         for (const e of entries) list[e.tick] = { a: e.a, b: e.b };
+        for (let t = 0; t < length; t++) if (!list[t]) list[t] = null;
         total = length;
       }
       sendReset(list, total);
@@ -592,12 +661,24 @@
   $('dslImport').addEventListener('click', () => dslLoad(false));
   $('dslAppend').addEventListener('click', () => dslLoad(true));
 
-  $('bExport').addEventListener('click', () => {
+  $('bExport').addEventListener('click', async () => {
+    if (pending > 0) return; // 按钮已禁用，这里双保险
+    // 等待在途代次全部落定，保证导出的 commands 与 frames 来自同一版本。
+    // 否则会导出“新指令 + 旧帧”的混合包，导入重放后与导出时所见不符。
+    await whenIdle();
     const r = client.result;
+    const expected = cmds.slice(0, cmds.length);
+    if (r.length !== expected.length) {
+      // 理论上不会发生（落定后两者同源），失败时明确报错而不是导出错版
+      alert('指令日志（' + expected.length + ' tick）与重放帧（' + r.length +
+        ' tick）版本不一致，请稍候重放完成后再导出。');
+      updateExportLock();
+      return;
+    }
     const payload = {
       format: 'grid-replay', version: 1, grid: G,
       length: r.length,
-      commands: Array.from({ length: r.length }, (_, t) => cmds[t] || null),
+      commands: Array.from({ length: r.length }, (_, t) => expected[t] || null),
       frames: r.frames
     };
     const blob = new Blob([JSON.stringify(payload)], { type: 'application/json' });
