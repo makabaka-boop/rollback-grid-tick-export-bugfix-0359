@@ -39,10 +39,22 @@ npx http-server .          # 或 python3 -m http.server
   （不是只改当前画面）；不受影响的前缀帧原样保留，测试中以对象同一性断言验证。
 - 日志最长 **300 tick**；支持缩短（截掉尾部指令并重算）、删除单 tick 指令（回到缺省停留）。
 
-## 代次（generation）与唯一结果源
+## 代次（generation）、在途守卫与唯一结果源
 
 - 主线程每次 `reset/patch` 递增 `gen`；Worker 回复带 `gen`，客户端只接受“当前最新一代”的结果，
   旧代次响应即使延迟到达也直接丢弃并计数（状态栏可见）。
+- **在途（busy）期间允许继续编辑/追加**：主线程另维护一个与“最后一次已提交请求”同步的
+  `desiredLength`，追加落点（随机追加、DSL 追加、编辑器续写）一律以它为准，
+  **不读可能暂时落后的 `result.length`**——否则重放未完成时连续追加会把后一批压到前一批的 tick 上。
+  Worker 顺序处理消息，编辑在途安全，最新代次的 `update/error` 到达后画面自然收敛。
+- **busy 期间导出按钮禁用**：此时 `result.frames` 可能是上一代的旧画面，强行导出会拼出
+  “新 commands + 旧 frames”的跨版本文件。点击也会被再次拦截。
+- **导出一致性闸门**：导出前用同一份内核在主线程按 `commands` 从头重放并逐帧比对 `frames`，
+  不一致即中止导出；因此刷新后重新导入（Worker 按 commands 重放验证）必然复现导出时所见。
+- **localStorage 持久化的是“目标日志”**（`desiredLength` 截断的 commands），
+  在途期间关闭/刷新页面也不会把已提交的尾部指令丢掉或按旧长度截断。
+- 越过当前末尾编辑某个 tick（产生停留空档）会二次确认；缩短日志时立即丢弃镜像尾部，
+  避免旧尾部在新长度上复活。
 - **播放、单步、跳转、导出读取的是同一份重放结果**（客户端持有的 `result.frames`）。
 - 导出 JSON 含 `commands` 与全部 `frames`，可再次导入；导入后由 Worker 重新重放验证，而不是信任文件里的帧。
 
@@ -61,7 +73,7 @@ npx http-server .          # 或 python3 -m http.server
 | `replay-core.js` | UMD 零依赖内核：棋盘/裁决纯函数、有状态 `Replayer`（检查点重放）、`serveWorker`、`createReplayClient`（代次守卫）。浏览器/Worker/Node 共用同一份权威实现 |
 | `replay-worker.js` | Worker 入口（Node `worker_threads` 与浏览器 hosted Worker 双用） |
 | `index.html` | 单文件页面；Blob 内联内核启动 Worker，主线程计算兜底 |
-| `test/replay.test.js` | node:test 套件（17 个用例，含真实 Worker 线程） |
+| `test/replay.test.js` | node:test 套件（20 个用例，含真实 Worker 线程） |
 
 ## 测试
 
@@ -80,4 +92,7 @@ node --test test/
 5. 检查点复用的对象同一性（不受影响区间保留、受影响区间重建）；
 6. 缩短后再增长（尾部指令已清理按停留处理）、删除单 tick 指令、非法 patch 整体回滚不改既有状态；
 7. 真实 `worker_threads` 端到端：快速连发两代 reset，旧代次结果内容本身仍正确但**不得覆盖**新日志
-   （`dropped` 计数、`result` 保持新版本）；连续 patch 的旧响应被丢弃；Worker 错误以 error 返回且不更新结果。
+   （`dropped` 计数、`result` 保持新版本）；连续 patch 的旧响应被丢弃；Worker 错误以 error 返回且不更新结果；
+8. **在途竞态**：客户端 `busy` 在发出请求时置位、仅“最新代次”的 `update/error` 能解除，旧代次迟到回复不解除；
+   不等待确认连发两代追加，两批分别落在正确 tick（无覆盖、无空档），最终结果与从头完整重放一致——
+   对应页面“重放未完成继续编辑/追加/导出”的防护。

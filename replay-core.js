@@ -381,6 +381,8 @@
   /**
    * 主线程侧客户端：代次（gen）单调递增，只接受“当前最新一代”的结果，
    * 旧 gen 的 Worker 响应（即使延迟到达）一律丢弃，绝不覆盖新日志的画面。
+   * busy 标记“最新一代请求是否仍在途”：在途时 result.frames 可能落后于
+   * 已提交日志，需要版本一致的操作（导出）必须等 busy 解除。
    * 播放 / 单步 / 跳转 / 导出全部读取这里持有的同一份 result。
    */
   function createReplayClient(post) {
@@ -388,12 +390,16 @@
     const client = {
       gen: 0,
       lastSentGen: 0,
+      // 是否有一代请求尚在途（Worker 尚未对“最新一代”给出 update/error）。
+      // 在途期间 frames 可能落后于调用方已提交的日志，导出等需要版本一致的操作应等待。
+      busy: false,
       dropped: 0,
       errors: 0,
       result: { frames: [makeInitialFrame()], length: 0 },
       _send(msg) {
         msg.id = ++seq;
         this.lastSentGen = msg.gen;
+        this.busy = true;
         post(msg);
         return msg.id;
       },
@@ -408,6 +414,9 @@
       /** @returns {boolean} 是否被接受；false 表示旧代次/无关消息，已丢弃 */
       accept(msg) {
         if (!msg || typeof msg !== 'object') return false;
+        // 只有“最新一代”的终结消息（update 或 error）能解除 busy；
+        // 旧代次的迟到回复不改变状态，busy 仍属于更新的在途代次。
+        if (msg.gen === this.lastSentGen) this.busy = false;
         if (msg.type === 'error') {
           this.errors++;
           return false;

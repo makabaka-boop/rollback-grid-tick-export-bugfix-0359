@@ -326,6 +326,42 @@ test('长度上限 300 与参数校验；失败的 patch 不改动现有状态',
   assert.deepEqual(rep.getResult(), before, '校验失败必须整体回滚，状态不变');
 });
 
+test('客户端 busy 守卫：在途期间置位；仅最新代次的终结消息能解除；导出侧可据此拦截跨版本拼装', () => {
+  const inbox = [];
+  const client = C.createReplayClient((m) => inbox.push(m));
+  assert.equal(client.busy, false, '初始无在途请求');
+
+  client.reset([], 10); // gen 1
+  const gen1 = inbox[0];
+  assert.equal(client.busy, true, '请求发出即 busy');
+
+  client.patch([{ tick: 0, a: 'up' }], 10); // gen 2，gen1 立刻过期
+  const gen2 = inbox[1];
+  assert.equal(client.busy, true);
+
+  // gen1 的迟到 update：被丢弃且不能解除 busy（最新代次仍在途）
+  assert.equal(client.accept({ type: 'update', id: gen1.id, gen: 1,
+    frames: C.replayFrames([], 10).frames, length: 10 }), false);
+  assert.equal(client.busy, true, '旧代次响应不得解除 busy');
+  assert.equal(client.dropped, 1);
+
+  // gen2 的 error 同样是“最新代次的终结”：解除 busy，但不更新结果
+  assert.equal(client.accept({ type: 'error', id: gen2.id, gen: 2, message: 'boom' }), false);
+  assert.equal(client.busy, false, '最新代次的 error 必须解除 busy');
+  assert.equal(client.errors, 1);
+  assert.equal(client.result.length, 0, 'error 不得更新结果');
+
+  // 正常往返：busy 在收到最新 update 时解除
+  client.reset(entriesOf([{ a: 'right' }, { a: 'right' }]), 2); // gen 3
+  assert.equal(client.busy, true);
+  const gen3 = inbox[2];
+  const ref = full([{ a: 'right' }, { a: 'right' }], 2);
+  assert.equal(client.accept({ type: 'update', id: gen3.id, gen: 3,
+    frames: ref.frames, length: 2 }), true);
+  assert.equal(client.busy, false);
+  assert.deepEqual(client.result, ref);
+});
+
 // ---------------------------------------------------------------- Worker（真实 worker_threads）
 test('Worker 端到端：分批结果与主线程一致，旧代次响应不得覆盖新日志', async (t) => {
   const worker = new Worker(path.join(__dirname, '..', 'replay-worker.js'));
@@ -403,6 +439,31 @@ test('Worker 端到端：分批结果与主线程一致，旧代次响应不得�
     const err = await recv();
     assert.equal(err.type, 'error');
     assert.equal(client.result.length, lenBefore);
+  });
+
+  await t.test('重放未确认时连续追加两批（模拟页面 desiredLength 续写）：落点正确、无空档无覆盖', async () => {
+    // 复刻页面在修复前的竞态：旧实现以“已确认长度”定位，第二批会覆盖第一批；
+    // 修复后以已提交的目标长度 desiredLength 定位。
+    const batch1 = randSlots(C.mulberry32(301), 5, true);
+    const batch2 = randSlots(C.mulberry32(302), 5, true);
+
+    client.reset(entriesOf(batch1), 5);        // gen N（不等待）
+    // 页面镜像在发送时即更新；目标长度立即推进到 10
+    const edits2 = batch2.map((s, i) => Object.assign({ tick: 5 + i }, s));
+    client.patch(edits2, 10);                  // gen N+1，紧跟其后
+    assert.equal(client.busy, true);
+
+    // 收完两代回复（第一代可能被丢弃）
+    await recv();
+    const last = await recv();
+    assert.equal(last.type, 'update');
+    assert.equal(client.busy, false, '两代处理完 busy 必须解除');
+    assert.equal(client.result.length, 10);
+
+    // 页面导出闸门：按最终 commands 从头重放，必须与 Worker 帧逐帧一致
+    const combined = batch1.concat(batch2);
+    assert.deepEqual(client.result, full(combined, 10),
+      '两批指令必须都在正确 tick 上（0..4 与 5..9），无覆盖、无空档');
   });
 
   await worker.terminate();

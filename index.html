@@ -67,7 +67,7 @@
 <header>
   <h1>12×12 双人格点回放器</h1>
   <span class="sub">完全本地运行 · 每 tick 双方各提交 上/下/左/右/停留 · Worker 计算 · 每 10 tick 检查点重放</span>
-  <span id="status"></span>
+  <span id="status"></span><span id="busyTag" style="color:#ffd166"></span>
 </header>
 
 <main>
@@ -230,13 +230,22 @@
   const client = C.createReplayClient((m) => worker.postMessage(m));
   worker.addEventListener('message', (ev) => {
     const m = ev.data;
-    if (m.type === 'error') { client.accept(m); alert('重放错误：' + m.message); return; }
+    if (m.type === 'error') {
+      client.accept(m);
+      onResult(); // busy 解除、按钮恢复
+      alert('重放错误：' + m.message);
+      return;
+    }
     if (client.accept(m)) onResult();
+    else if (m.type === 'update') refreshBusyUI(); // 旧代次迟到响应：busy 仍属新代次
   });
 
   // ---------- 本地状态 ----------
   const LS_KEY = 'gridReplay.v1';
   let cmds = [];                 // 镜像指令：cmds[t] = {a?,b?}，缺省=停留
+  // 已提交给 Worker 的“目标日志”长度。重放结果可能因 Worker 在途而暂时落后，
+  // 但追加/编辑的落点必须以目标长度为准——否则重放未完成时连续追加会覆盖前一批。
+  let desiredLength = 0;
   let cursor = 0;                // 当前查看的 tick
   let editTick = 0;
   let playing = false, playTimer = null;
@@ -256,23 +265,47 @@
     .map((c, t) => (c ? Object.assign({ tick: t }, c) : null))
     .filter(Boolean);
 
+  // reset 是绝对状态：镜像与目标长度整体替换，不依赖任何在途结果。
   function sendReset(list, length) {
+    if (!Number.isInteger(length) || length < 0 || length > C.MAX_TICKS) {
+      alert('日志长度必须是 0..' + C.MAX_TICKS + ' 的整数，收到: ' + length);
+      return;
+    }
     cmds = [];
     for (let t = 0; t < length; t++) cmds[t] = list[t] ? Object.assign({}, list[t]) : null;
+    desiredLength = length;
     stopPlay();
     client.reset(entriesOf(cmds), length);
+    persist();
+    refreshBusyUI();
   }
 
+  // patch 是增量：镜像已由调用方改好，这里只同步目标长度并发送。
+  function sendPatch(edits, length) {
+    if (!Number.isInteger(length) || length < 0 || length > C.MAX_TICKS) {
+      alert('日志长度必须是 0..' + C.MAX_TICKS + ' 的整数，收到: ' + length);
+      return;
+    }
+    desiredLength = length;
+    stopPlay();
+    client.patch(edits, length);
+    persist();
+    refreshBusyUI();
+  }
+
+  // 持久化的始终是“目标日志”（与已发送给 Worker 的最后一次请求一致），
+  // 而不是按可能落后的 result.length 截断——否则在途期间刷新会丢失尾部指令。
   function persist() {
     try {
       localStorage.setItem(LS_KEY, JSON.stringify({
-        commands: cmds.slice(0, client.result.length),
-        length: client.result.length
+        commands: cmds.slice(0, desiredLength),
+        length: desiredLength
       }));
     } catch (e) { /* 隐私模式等：忽略 */ }
   }
 
   function onResult() {
+    // Worker 已确认到与目标长度一致（顺序处理保证：收到的最新代次就对应最后一次请求）
     const len = client.result.length;
     if (cursor > len) cursor = len;
     if (editTick > len) editTick = Math.max(0, len);
@@ -283,6 +316,17 @@
     $('eLen').value = len;
     renderAll();
     persist();
+    refreshBusyUI();
+  }
+
+  // 在途期间禁用导出（避免 commands 与 frames 跨版本拼装），并在状态栏给出明确提示
+  function refreshBusyUI() {
+    const busy = client.busy;
+    const btn = $('bExport');
+    btn.disabled = busy;
+    btn.title = busy ? '重放仍在进行：当前帧可能落后于已提交指令，请稍候再导出' : '';
+    const busyTag = $('busyTag');
+    busyTag.textContent = busy ? ' · ⏳ 重放中（已提交 ' + desiredLength + ' tick，等待 Worker 确认）' : '';
   }
 
   // ---------- 棋盘渲染 ----------
@@ -434,10 +478,17 @@
   function renderEditor() {
     const len = client.result.length;
     $('eTick').value = editTick;
-    $('eTickHint').textContent =
-      editTick >= len
-        ? (editTick >= C.MAX_TICKS ? '已达 300 tick 上限' : '（提交将追加为新 tick）')
-        : '（改动将从 tick ' + (Math.floor(editTick / 10) * 10) + ' 检查点重放）';
+    let hint;
+    if (editTick >= C.MAX_TICKS) hint = '已达 300 tick 上限';
+    else if (editTick >= desiredLength) {
+      hint = (editTick === desiredLength)
+        ? '（提交将续写为第 ' + desiredLength + ' tick）'
+        : '⚠ 将在 ' + (editTick - desiredLength) +
+          ' 个停留 tick 的空档之后写入（提交前会再次确认）';
+    } else {
+      hint = '（改动将从 tick ' + (Math.floor(editTick / 10) * 10) + ' 检查点重放）';
+    }
+    $('eTickHint').textContent = hint;
     const c0 = cmds[editTick];
     $('eA').value = (c0 && c0.a) || 'stay';
     $('eB').value = (c0 && c0.b) || 'stay';
@@ -482,17 +533,25 @@
 
   // ---------- 编辑器 ----------
   function commitTick(clear) {
-    const len = client.result.length;
-    const t = Math.min(editTick, C.MAX_TICKS);
-    const newLen = Math.max(len, t + 1);
+    const t = editTick;
+    if (t < 0 || t >= C.MAX_TICKS) {
+      alert('tick 必须位于 0..' + (C.MAX_TICKS - 1));
+      return;
+    }
+    // 落点以“目标长度”为准：重放可能在途，result.length 暂时落后
+    const newLen = Math.max(desiredLength, t + 1);
+    // 越过当前末尾编辑 = 制造稀疏空档（中间 tick 全部按停留），明确告知而非伪装成“追加”
+    if (t > desiredLength) {
+      if (!window.confirm('tick ' + t + ' 在当前末尾（' + desiredLength +
+        '）之后，中间 ' + (t - desiredLength) + ' 个 tick 将按停留处理、形成空档。确定提交？')) return;
+    }
     const edit = { tick: t };
     if (clear) { edit.a = null; edit.b = null; cmds[t] = null; }
     else {
       edit.a = $('eA').value; edit.b = $('eB').value;
       cmds[t] = { a: edit.a, b: edit.b };
     }
-    stopPlay();
-    client.patch([edit], newLen);
+    sendPatch([edit], newLen);
   }
   $('eCommit').addEventListener('click', () => commitTick(false));
   $('eClear').addEventListener('click', () => commitTick(true));
@@ -500,21 +559,20 @@
     editTick = Math.max(0, editTick - 1); renderEditor(); renderTimeline();
   });
   $('eNextT').addEventListener('click', () => {
-    editTick = Math.min(C.MAX_TICKS, Math.min(client.result.length, editTick + 1));
+    editTick = Math.min(C.MAX_TICKS - 1, Math.min(desiredLength, editTick + 1));
     renderEditor(); renderTimeline();
   });
   $('eTick').addEventListener('change', () => {
-    editTick = Math.max(0, Math.min(C.MAX_TICKS, Number($('eTick').value) || 0));
+    editTick = Math.max(0, Math.min(C.MAX_TICKS - 1, Number($('eTick').value) || 0));
     renderEditor(); renderTimeline();
   });
   $('eSetLen').addEventListener('click', () => {
     const n = Math.max(0, Math.min(C.MAX_TICKS, Number($('eLen').value) || 0));
-    cmds.length = n;
-    stopPlay();
-    client.patch([], n);
+    if (n < desiredLength) cmds.length = n; // 缩短：立刻丢弃尾部，避免旧尾部在新长度上复活
+    sendPatch([], n);
   });
   $('eRand10').addEventListener('click', () => {
-    const len = client.result.length;
+    const len = desiredLength; // 用目标长度：在途时连点也从正确的末尾续写
     if (len >= C.MAX_TICKS) return;
     const rnd = C.mulberry32((Date.now() >>> 0) ^ len);
     const dirs = C.DIR_NAMES;
@@ -524,8 +582,7 @@
       edits.push({ tick: len + i, a: dirs[Math.floor(rnd() * 5)], b: dirs[Math.floor(rnd() * 5)] });
       cmds[len + i] = { a: edits[i].a, b: edits[i].b };
     }
-    stopPlay();
-    client.patch(edits, len + n);
+    sendPatch(edits, len + n);
   });
 
   // ---------- DSL / JSON 导入导出 ----------
@@ -569,35 +626,53 @@
   }
 
   function dslLoad(append) {
+    let parsed;
     try {
-      const { entries, length } = parseDsl($('dsl').value);
-      let list, total;
-      if (append) {
-        list = cmds.slice();
-        total = client.result.length;
-        for (const e of entries) {
-          const t = total + e.tick;
-          if (t >= C.MAX_TICKS) break;
-          list[t] = { a: e.a, b: e.b };
-          total = Math.max(total, t + 1);
-        }
-      } else {
-        list = new Array(length);
-        for (const e of entries) list[e.tick] = { a: e.a, b: e.b };
-        total = length;
+      parsed = parseDsl($('dsl').value);
+    } catch (e) { alert('DSL 解析失败：' + e.message); return; }
+    const { entries, length } = parsed;
+    let list, total;
+    if (append) {
+      list = cmds.slice();
+      total = desiredLength; // 以目标长度续写：重放在途时连续追加也不会覆盖前一批
+      for (const e of entries) {
+        const t = total + e.tick;
+        if (t >= C.MAX_TICKS) break;
+        list[t] = { a: e.a, b: e.b };
+        total = Math.max(total, t + 1);
       }
-      sendReset(list, total);
-    } catch (e) { alert('DSL 解析失败：' + e.message); }
+    } else {
+      if (length > C.MAX_TICKS) { alert('日志长度 ' + length + ' 超过上限 ' + C.MAX_TICKS); return; }
+      list = new Array(length);
+      for (const e of entries) list[e.tick] = { a: e.a, b: e.b };
+      total = length;
+    }
+    sendReset(list, total);
   }
   $('dslImport').addEventListener('click', () => dslLoad(false));
   $('dslAppend').addEventListener('click', () => dslLoad(true));
 
   $('bExport').addEventListener('click', () => {
+    if (client.busy) {
+      alert('重放仍在进行（gen=' + client.gen + ' 尚未确认）。\n' +
+        '此时导出会把“新指令”和“旧帧”拼在同一份文件里，请等待状态栏提示消失后再导出。');
+      return;
+    }
     const r = client.result;
+    const commands = Array.from({ length: r.length }, (_, t) => cmds[t] || null);
+    // 一致性闸门：用同一份内核在主线程按 commands 从头重放，逐帧核对。
+    // 任何镜像/Worker 背离都在这里暴露，绝不导出自相矛盾的文件。
+    const verify = C.replayFrames(entriesOf(commands), r.length);
+    if (verify.length !== r.length ||
+        JSON.stringify(verify.frames) !== JSON.stringify(r.frames)) {
+      alert('导出中止：当前指令与逐帧画面不一致（可能上一代重放尚未完成）。\n' +
+        '请稍候再试；若仍异常，可点“恢复演示”后重新编辑。');
+      return;
+    }
     const payload = {
       format: 'grid-replay', version: 1, grid: G,
       length: r.length,
-      commands: Array.from({ length: r.length }, (_, t) => cmds[t] || null),
+      commands: commands,
       frames: r.frames
     };
     const blob = new Blob([JSON.stringify(payload)], { type: 'application/json' });
@@ -616,8 +691,13 @@
         const j = JSON.parse(rd.result);
         if (j.format !== 'grid-replay' || !Array.isArray(j.commands))
           throw new Error('不是本回放器导出的 JSON');
-        const list = j.commands.map((c) => c || null);
-        sendReset(list, j.length);
+        const length = Number.isInteger(j.length) ? j.length : j.commands.length;
+        if (length < 0 || length > C.MAX_TICKS)
+          throw new Error('日志长度越界: ' + j.length);
+        const list = j.commands.slice(0, length).map((c) => c || null);
+        // 导入只以 commands 为权威；长度不足 300 上限时补齐尾部（缺省=停留）
+        while (list.length < length) list.push(null);
+        sendReset(list, length);
       } catch (e) { alert('导入失败：' + e.message); }
       this.value = '';
     };
