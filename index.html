@@ -1,0 +1,660 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>12×12 双人格点回放器</title>
+<style>
+  :root{
+    --bg:#15181f; --panel:#1d222c; --panel2:#252b38; --line:#323a49;
+    --fg:#e6e9ef; --dim:#94a0b4; --accent:#5aa7ff;
+    --a:#4ea1ff; --b:#ff6b6b; --pick:#ffd166; --wall:#4a5366;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+    font:14px/1.5 -apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif}
+  header{padding:10px 16px;border-bottom:1px solid var(--line);display:flex;
+    align-items:baseline;gap:12px;flex-wrap:wrap}
+  header h1{font-size:16px;margin:0}
+  header .sub{color:var(--dim);font-size:12px}
+  #status{margin-left:auto;color:var(--dim);font-size:12px;font-variant-numeric:tabular-nums}
+  main{display:grid;grid-template-columns:auto 340px;gap:16px;padding:16px;align-items:start}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px}
+  .panel h2{font-size:13px;margin:0 0 10px;color:var(--dim);font-weight:600;
+    text-transform:uppercase;letter-spacing:.08em}
+  #boardWrap{position:relative}
+  canvas{display:block;border-radius:6px;background:#10131a}
+  #frameInfo{margin-top:10px;font-size:13px;font-variant-numeric:tabular-nums}
+  #frameInfo .scores{display:flex;gap:16px;margin:6px 0}
+  #frameInfo .events{min-height:22px;color:var(--pick)}
+  .ev{margin-right:10px;white-space:nowrap}
+  .controls{display:flex;gap:6px;flex-wrap:wrap;margin:10px 0;align-items:center}
+  button,select,input[type=number]{background:var(--panel2);color:var(--fg);
+    border:1px solid var(--line);border-radius:6px;padding:5px 10px;font-size:13px;cursor:pointer}
+  button:hover{border-color:var(--accent)}
+  button.primary{background:#23405f;border-color:#345b86}
+  input[type=number]{width:64px;cursor:auto}
+  #timeline{display:flex;gap:2px;overflow-x:auto;padding:6px 2px;background:#10131a;
+    border-radius:6px}
+  .cell{flex:0 0 auto;width:12px;height:22px;border-radius:2px;background:#2b3342;
+    position:relative;cursor:pointer;border:1px solid transparent}
+  .cell:hover{outline:1px solid var(--accent)}
+  .cell.cp{border-color:#5b6579}
+  .cell.cur{outline:2px solid #fff;outline-offset:-1px}
+  .cell.pick{background:#7a6420}
+  .cell.wall::after{content:"";position:absolute;left:1px;right:1px;bottom:1px;height:2px;background:#ff9d9d}
+  .cell.meet::after{content:"";position:absolute;left:1px;right:1px;bottom:1px;height:2px;background:#ff6b6b}
+  .cell.edit{box-shadow:inset 0 0 0 2px var(--accent)}
+  #tlHint{color:var(--dim);font-size:12px;margin-top:4px}
+  #summary{max-height:200px;overflow-y:auto;font-size:12px;font-variant-numeric:tabular-nums;
+    background:#10131a;border-radius:6px;padding:6px}
+  .sumline{padding:1px 6px;border-radius:4px;cursor:pointer;white-space:nowrap}
+  .sumline:hover{background:#1d2430}
+  .sumline.cur{background:#24334b;color:#fff}
+  .sumline.cp{color:#8fb6e8}
+  aside{display:flex;flex-direction:column;gap:14px}
+  .row{display:flex;gap:8px;align-items:center;margin:6px 0;flex-wrap:wrap}
+  label.lab{color:var(--dim);font-size:12px;min-width:56px}
+  textarea{width:100%;min-height:90px;resize:vertical;background:#10131a;color:var(--fg);
+    border:1px solid var(--line);border-radius:6px;padding:8px;font:12px/1.5 ui-monospace,Menlo,Consolas,monospace}
+  .aCol{color:var(--a)} .bCol{color:var(--b)}
+  .hint{color:var(--dim);font-size:12px;margin-top:6px}
+  .sep{height:1px;background:var(--line);margin:10px 0}
+  @media (max-width:900px){ main{grid-template-columns:1fr} }
+</style>
+</head>
+<body>
+<header>
+  <h1>12×12 双人格点回放器</h1>
+  <span class="sub">完全本地运行 · 每 tick 双方各提交 上/下/左/右/停留 · Worker 计算 · 每 10 tick 检查点重放</span>
+  <span id="status"></span>
+</header>
+
+<main>
+  <section class="panel">
+    <h2>棋盘（蓝 = A，红 = B，黄 = 一次性拾取物，灰 = 固定墙）</h2>
+    <div id="boardWrap"><canvas id="board" width="480" height="480"></canvas></div>
+
+    <div id="frameInfo">
+      <div><strong id="fTick">tick 0</strong>
+        <span id="fCmd" class="hint"></span></div>
+      <div class="scores">
+        <span class="aCol">A 分数：<b id="fScoreA">0</b> · 位置 <span id="fPosA">(0,0)</span></span>
+        <span class="bCol">B 分数：<b id="fScoreB">0</b> · 位置 <span id="fPosB">(11,11)</span></span>
+      </div>
+      <div class="events" id="fEvents"></div>
+    </div>
+
+    <div class="controls">
+      <button id="bFirst" title="首帧">⏮</button>
+      <button id="bPrev" title="上一 tick（←）">◀</button>
+      <button id="bPlay" class="primary" title="播放/暂停（空格）">▶ 播放</button>
+      <button id="bNext" title="下一 tick（→）">▶</button>
+      <button id="bLast" title="末帧">⏭</button>
+      <span class="hint">速度</span>
+      <select id="speed">
+        <option value="2">2 /秒</option>
+        <option value="5">5 /秒</option>
+        <option value="10" selected>10 /秒</option>
+        <option value="20">20 /秒</option>
+      </select>
+      <span class="hint">跳转到</span>
+      <input type="number" id="jumpTo" min="0" value="0" style="width:70px">
+      <button id="bJump">跳转</button>
+    </div>
+
+    <h2 style="margin-top:14px">时间线（粗边框 = 每 10 tick 检查点，点击跳转；蓝框 = 正在编辑的 tick）</h2>
+    <div id="timeline"></div>
+    <div id="tlHint" class="hint"></div>
+
+    <h2 style="margin-top:14px">逐 tick 状态摘要（改日志后从最近检查点整体重算）</h2>
+    <div id="summary"></div>
+  </section>
+
+  <aside>
+    <div class="panel">
+      <h2>指令编辑器（改动过去的 tick 会触发检查点重放）</h2>
+      <div class="row">
+        <label class="lab">Tick</label>
+        <button id="ePrevT">−</button>
+        <input type="number" id="eTick" min="0" value="0">
+        <button id="eNextT">+</button>
+        <span id="eTickHint" class="hint"></span>
+      </div>
+      <div class="row">
+        <label class="lab aCol">A 指令</label>
+        <select id="eA">
+          <option value="up">上 ↑</option><option value="down">下 ↓</option>
+          <option value="left">左 ←</option><option value="right">右 →</option>
+          <option value="stay" selected>停留 ·</option>
+        </select>
+      </div>
+      <div class="row">
+        <label class="lab bCol">B 指令</label>
+        <select id="eB">
+          <option value="up">上 ↑</option><option value="down">下 ↓</option>
+          <option value="left">左 ←</option><option value="right">右 →</option>
+          <option value="stay" selected>停留 ·</option>
+        </select>
+      </div>
+      <div class="row">
+        <button class="primary" id="eCommit">提交本 tick（Enter）</button>
+        <button id="eClear">清除本 tick（缺省=停留）</button>
+      </div>
+      <div class="sep"></div>
+      <div class="row">
+        <label class="lab">日志长度</label>
+        <input type="number" id="eLen" min="0" max="300" value="0" style="width:70px">
+        <button id="eSetLen">设定（可缩短/延长）</button>
+      </div>
+      <div class="row">
+        <button id="eRand10">追加随机 10 tick（分批送入演示）</button>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>批量导入（DSL）</h2>
+      <textarea id="dsl" placeholder=
+"每行一个 tick（按顺序）：两位指令，U上 D下 L左 R右 S停留，如 RU（A右 B上）。
+也可绝对定位：3:aR,bU（可用中文：3:a右,b左）。# 开头为注释。"></textarea>
+      <div class="row" style="margin-bottom:0">
+        <button id="dslImport" class="primary">作为新日志导入</button>
+        <button id="dslAppend">追加到末尾</button>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>导入 / 导出 JSON</h2>
+      <div class="row" style="margin:0">
+        <button id="bExport" class="primary">导出完整重放结果（含逐帧状态）</button>
+        <label class="lab" style="min-width:auto">
+          <input type="file" id="fileImport" accept=".json,application/json" hidden>
+          <button id="bImport">从 JSON 导入</button>
+        </label>
+        <button id="bResetDemo">恢复演示</button>
+      </div>
+      <div class="hint">导出的 frames 即播放、单步、跳转共用的同一份 Worker 重放结果。
+        日志保存在 localStorage（每 10 tick 检查点的帧由 Worker 持有）。
+        <button id="bWipe" style="margin-left:6px">清除本地存档</button>
+      </div>
+    </div>
+  </aside>
+</main>
+
+<script src="replay-core.js"></script>
+<script>
+'use strict';
+(function () {
+  const C = window.ReplayCore;
+  const G = C.GRID;
+  const $ = (id) => document.getElementById(id);
+
+  // ---------- Worker：优先 Blob 内联同一份内核（file:// 也可用），失败则主线程兜底 ----------
+  function createFakeWorker() {
+    const rep = new C.Replayer();
+    const handlers = [];
+    setTimeout(() => $('status').textContent += ' · ⚠ Blob Worker 不可用，已切换主线程计算', 0);
+    return {
+      kind: '主线程兜底',
+      addEventListener: (t, fn) => { if (t === 'message') handlers.push(fn); },
+      postMessage: (msg) => setTimeout(() => {
+        let reply;
+        try {
+          if (msg.type === 'reset') rep.reset(msg.entries, msg.length);
+          else rep.patch(msg.edits, msg.length);
+          const r = rep.getResult();
+          reply = { type: 'update', id: msg.id, gen: msg.gen, frames: r.frames, length: r.length };
+        } catch (e) {
+          reply = { type: 'error', id: msg.id, gen: msg.gen, message: String(e.message || e) };
+        }
+        handlers.forEach((h) => h({ data: reply }));
+      }, 0)
+    };
+  }
+
+  function createWorker() {
+    try {
+      const src =
+        'self.ReplayCore=(' + C.FACTORY.toString() + ')();\n' +
+        'self.ReplayCore.serveWorker(self);';
+      const url = URL.createObjectURL(new Blob([src], { type: 'application/javascript' }));
+      const w = new Worker(url);
+      w.kind = 'Blob Worker（内联内核）';
+      return w;
+    } catch (e) {
+      return createFakeWorker();
+    }
+  }
+
+  const worker = createWorker();
+  const client = C.createReplayClient((m) => worker.postMessage(m));
+  worker.addEventListener('message', (ev) => {
+    const m = ev.data;
+    if (m.type === 'error') { client.accept(m); alert('重放错误：' + m.message); return; }
+    if (client.accept(m)) onResult();
+  });
+
+  // ---------- 本地状态 ----------
+  const LS_KEY = 'gridReplay.v1';
+  let cmds = [];                 // 镜像指令：cmds[t] = {a?,b?}，缺省=停留
+  let cursor = 0;                // 当前查看的 tick
+  let editTick = 0;
+  let playing = false, playTimer = null;
+
+  const demoCommands = (function () {
+    const s = (a, b) => ({ a: a, b: b });
+    return [
+      s('right', 'left'), s('right', 'left'), s('down', 'up'),
+      s('down', 'up'), s('right', 'up'), s('right', 'left'),
+      s('down', 'left'), s('down', 'left'), s('right', 'up'),
+      s('down', 'up'), s('right', 'left'), s('right', 'up'),
+      s('down', 'stay'), s('stay', 'up')
+    ];
+  })();
+
+  const entriesOf = (arr) => arr
+    .map((c, t) => (c ? Object.assign({ tick: t }, c) : null))
+    .filter(Boolean);
+
+  function sendReset(list, length) {
+    cmds = [];
+    for (let t = 0; t < length; t++) cmds[t] = list[t] ? Object.assign({}, list[t]) : null;
+    stopPlay();
+    client.reset(entriesOf(cmds), length);
+  }
+
+  function persist() {
+    try {
+      localStorage.setItem(LS_KEY, JSON.stringify({
+        commands: cmds.slice(0, client.result.length),
+        length: client.result.length
+      }));
+    } catch (e) { /* 隐私模式等：忽略 */ }
+  }
+
+  function onResult() {
+    const len = client.result.length;
+    if (cursor > len) cursor = len;
+    if (editTick > len) editTick = Math.max(0, len);
+    if (playing && cursor >= len) stopPlay();
+    $('status').textContent =
+      worker.kind + ' · 代次 gen=' + client.gen +
+      ' · 已丢弃旧代次响应 ' + client.dropped + ' 次 · 日志 ' + len + '/' + C.MAX_TICKS + ' tick';
+    $('eLen').value = len;
+    renderAll();
+    persist();
+  }
+
+  // ---------- 棋盘渲染 ----------
+  const canvas = $('board'), ctx = canvas.getContext('2d');
+  (function setupDpr() {
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = 480 * dpr; canvas.height = 480 * dpr;
+    canvas.style.width = '480px'; canvas.style.height = '480px';
+    ctx.scale(dpr, dpr);
+  })();
+  const CELL = 40;
+
+  function drawPawn(x, y, color, ring) {
+    const cx = x * CELL + CELL / 2, cy = y * CELL + CELL / 2;
+    ctx.beginPath(); ctx.arc(cx, cy, 13, 0, Math.PI * 2);
+    ctx.fillStyle = color; ctx.fill();
+    ctx.lineWidth = 2; ctx.strokeStyle = ring; ctx.stroke();
+  }
+
+  function renderBoard() {
+    const f = client.result.frames[cursor] || C.makeInitialFrame();
+    ctx.clearRect(0, 0, 480, 480);
+    // 格线
+    ctx.strokeStyle = '#222834'; ctx.lineWidth = 1;
+    for (let i = 0; i <= G; i++) {
+      ctx.beginPath(); ctx.moveTo(i * CELL + .5, 0); ctx.lineTo(i * CELL + .5, 480); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(0, i * CELL + .5); ctx.lineTo(480, i * CELL + .5); ctx.stroke();
+    }
+    // 墙
+    ctx.fillStyle = '#4a5366';
+    for (const w of C.WALLS) {
+      const [x, y] = w.split(',').map(Number);
+      ctx.fillRect(x * CELL + 3, y * CELL + 3, CELL - 6, CELL - 6);
+    }
+    // 拾取物（已拾取变暗，颜色归拾取者）
+    for (const [x, y] of C.PICKUP_LIST) {
+      const k = x + ',' + y, got = f.collected[k];
+      ctx.beginPath();
+      ctx.arc(x * CELL + CELL / 2, y * CELL + CELL / 2, 7, 0, Math.PI * 2);
+      if (got) {
+        ctx.fillStyle = got <= f.tick && f.collected[k] !== undefined
+          ? (ownerAt(k, f) === 'A' ? 'rgba(78,161,255,.35)' : 'rgba(255,107,107,.35)')
+          : 'rgba(255,209,102,.9)';
+      } else ctx.fillStyle = 'rgba(255,209,102,.9)';
+      ctx.fill();
+    }
+    drawPawn(f.a.x, f.a.y, C2A(), '#cfe4ff');
+    drawPawn(f.b.x, f.b.y, C2B(), '#ffd4d4');
+
+    $('fTick').textContent = 'tick ' + f.tick;
+    $('fScoreA').textContent = f.scoreA; $('fScoreB').textContent = f.scoreB;
+    $('fPosA').textContent = '(' + f.a.x + ',' + f.a.y + ')';
+    $('fPosB').textContent = '(' + f.b.x + ',' + f.b.y + ')';
+    $('fEvents').innerHTML = eventHtml(f);
+    // 产生该帧的指令
+    if (f.tick > 0) {
+      const c0 = cmds[f.tick - 1];
+      $('fCmd').textContent = '本 tick 指令：A ' +
+        C.DIR_CN[(c0 && c0.a) || 'stay'] + ' / B ' + C.DIR_CN[(c0 && c0.b) || 'stay'];
+    } else $('fCmd').textContent = '（初始帧）';
+  }
+  function C2A(){return '#4ea1ff'} function C2B(){return '#ff6b6b'}
+  function ownerAt(k, f) {
+    // 由 collected[k] 的 tick 与历史帧事件判断拾取者（用于已拾取点着色）
+    const t = f.collected[k];
+    const fr = client.result.frames[t];
+    if (!fr) return null;
+    const ev = fr.events.find((e) => e.type === 'pickup' && (e.x + ',' + e.y) === k);
+    return ev ? ev.who : null;
+  }
+
+  function eventHtml(f) {
+    if (!f.events.length) return '<span class="hint">本 tick 无特殊事件</span>';
+    return f.events.map((e) => {
+      let txt = '';
+      if (e.type === 'wall') txt = (e.who === 'A' ? 'A' : 'B') + ' 撞墙，原地不动';
+      else if (e.type === 'meet_blocked') txt = '同格相遇，双方退回原位';
+      else if (e.type === 'swap_blocked') txt = '互换位置被阻止，双方退回原位';
+      else if (e.type === 'pickup') txt = (e.who === 'A' ? 'A' : 'B') +
+        ' 在 (' + e.x + ',' + e.y + ') 拾取 +' + e.value;
+      return '<span class="ev">• ' + txt + '</span>';
+    }).join('');
+  }
+
+  // ---------- 时间线 ----------
+  function renderTimeline() {
+    const tl = $('timeline');
+    tl.innerHTML = '';
+    const len = client.result.length;
+    for (let t = 0; t <= len; t++) {
+      const d = document.createElement('div');
+      d.className = 'cell' +
+        (t % C.CHECKPOINT_EVERY === 0 ? ' cp' : '') +
+        (t === cursor ? ' cur' : '') +
+        (t === editTick ? ' edit' : '');
+      if (t > 0) {
+        const f = client.result.frames[t];
+        if (f) {
+          if (f.events.some((e) => e.type === 'pickup')) d.classList.add('pick');
+          if (f.events.some((e) => e.type === 'wall')) d.classList.add('wall');
+          if (f.events.some((e) => e.type === 'meet_blocked' || e.type === 'swap_blocked'))
+            d.classList.add('meet');
+        }
+      }
+      d.title = 'tick ' + t;
+      d.addEventListener('click', () => { cursor = t; renderAll(); });
+      tl.appendChild(d);
+    }
+    $('tlHint').textContent =
+      '共 ' + (len + 1) + ' 帧（0..' + len + '），检查点位于 tick 0,10,20,…,共 ' +
+      (Math.floor(len / C.CHECKPOINT_EVERY) + 1) + ' 个';
+    const curEl = tl.children[cursor];
+    if (curEl) curEl.scrollIntoView({ block: 'nearest', inline: 'center' });
+  }
+
+  // ---------- 逐 tick 摘要 ----------
+  function renderSummary() {
+    const box = $('summary');
+    const frag = document.createDocumentFragment();
+    const frames = client.result.frames;
+    for (let t = 0; t < frames.length; t++) {
+      const f = frames[t];
+      const d = document.createElement('div');
+      d.className = 'sumline' + (t === cursor ? ' cur' : '') +
+        (t % C.CHECKPOINT_EVERY === 0 ? ' cp' : '');
+      let txt = 't=' + String(t).padStart(3) +
+        '  A(' + f.a.x + ',' + f.a.y + ') ' + f.scoreA +
+        '  B(' + f.b.x + ',' + f.b.y + ') ' + f.scoreB;
+      if (f.events.length) {
+        const tags = f.events.map((e) => {
+          if (e.type === 'wall') return e.who + '撞墙';
+          if (e.type === 'meet_blocked') return '相遇退回';
+          if (e.type === 'swap_blocked') return '互换退回';
+          if (e.type === 'pickup') return e.who + '拾取+1';
+          return e.type;
+        });
+        txt += '  ⟨' + tags.join('；') + '⟩';
+      }
+      d.textContent = txt;
+      d.addEventListener('click', () => { cursor = t; renderAll(); });
+      frag.appendChild(d);
+    }
+    box.innerHTML = '';
+    box.appendChild(frag);
+    const el = box.children[cursor];
+    if (el) el.scrollIntoView({ block: 'nearest' });
+  }
+
+  function renderEditor() {
+    const len = client.result.length;
+    $('eTick').value = editTick;
+    $('eTickHint').textContent =
+      editTick >= len
+        ? (editTick >= C.MAX_TICKS ? '已达 300 tick 上限' : '（提交将追加为新 tick）')
+        : '（改动将从 tick ' + (Math.floor(editTick / 10) * 10) + ' 检查点重放）';
+    const c0 = cmds[editTick];
+    $('eA').value = (c0 && c0.a) || 'stay';
+    $('eB').value = (c0 && c0.b) || 'stay';
+    $('jumpTo').max = len; $('jumpTo').value = cursor;
+  }
+
+  function renderAll() {
+    renderBoard(); renderTimeline(); renderSummary(); renderEditor();
+  }
+
+  // ---------- 播放 / 单步 / 跳转：全部读 client.result ----------
+  function stopPlay() {
+    playing = false;
+    if (playTimer) { clearTimeout(playTimer); playTimer = null; }
+    $('bPlay').textContent = '▶ 播放';
+  }
+  function tickPlay() {
+    if (!playing) return;
+    const len = client.result.length;
+    if (cursor >= len) { stopPlay(); return; }
+    cursor++; renderAll();
+    playTimer = setTimeout(tickPlay, 1000 / Number($('speed').value));
+  }
+  $('bPlay').addEventListener('click', () => {
+    if (playing) stopPlay();
+    else {
+      if (cursor >= client.result.length) cursor = 0;
+      playing = true; $('bPlay').textContent = '⏸ 暂停';
+      playTimer = setTimeout(tickPlay, 1000 / Number($('speed').value));
+    }
+  });
+  $('bFirst').addEventListener('click', () => { cursor = 0; renderAll(); });
+  $('bLast').addEventListener('click', () => { cursor = client.result.length; renderAll(); });
+  $('bPrev').addEventListener('click', () => { cursor = Math.max(0, cursor - 1); renderAll(); });
+  $('bNext').addEventListener('click', () => {
+    cursor = Math.min(client.result.length, cursor + 1); renderAll();
+  });
+  $('bJump').addEventListener('click', () => {
+    const v = Math.max(0, Math.min(client.result.length, Number($('jumpTo').value) || 0));
+    cursor = v; renderAll();
+  });
+
+  // ---------- 编辑器 ----------
+  function commitTick(clear) {
+    const len = client.result.length;
+    const t = Math.min(editTick, C.MAX_TICKS);
+    const newLen = Math.max(len, t + 1);
+    const edit = { tick: t };
+    if (clear) { edit.a = null; edit.b = null; cmds[t] = null; }
+    else {
+      edit.a = $('eA').value; edit.b = $('eB').value;
+      cmds[t] = { a: edit.a, b: edit.b };
+    }
+    stopPlay();
+    client.patch([edit], newLen);
+  }
+  $('eCommit').addEventListener('click', () => commitTick(false));
+  $('eClear').addEventListener('click', () => commitTick(true));
+  $('ePrevT').addEventListener('click', () => {
+    editTick = Math.max(0, editTick - 1); renderEditor(); renderTimeline();
+  });
+  $('eNextT').addEventListener('click', () => {
+    editTick = Math.min(C.MAX_TICKS, Math.min(client.result.length, editTick + 1));
+    renderEditor(); renderTimeline();
+  });
+  $('eTick').addEventListener('change', () => {
+    editTick = Math.max(0, Math.min(C.MAX_TICKS, Number($('eTick').value) || 0));
+    renderEditor(); renderTimeline();
+  });
+  $('eSetLen').addEventListener('click', () => {
+    const n = Math.max(0, Math.min(C.MAX_TICKS, Number($('eLen').value) || 0));
+    cmds.length = n;
+    stopPlay();
+    client.patch([], n);
+  });
+  $('eRand10').addEventListener('click', () => {
+    const len = client.result.length;
+    if (len >= C.MAX_TICKS) return;
+    const rnd = C.mulberry32((Date.now() >>> 0) ^ len);
+    const dirs = C.DIR_NAMES;
+    const edits = [];
+    const n = Math.min(10, C.MAX_TICKS - len);
+    for (let i = 0; i < n; i++) {
+      edits.push({ tick: len + i, a: dirs[Math.floor(rnd() * 5)], b: dirs[Math.floor(rnd() * 5)] });
+      cmds[len + i] = { a: edits[i].a, b: edits[i].b };
+    }
+    stopPlay();
+    client.patch(edits, len + n);
+  });
+
+  // ---------- DSL / JSON 导入导出 ----------
+  const dirMap = {
+    u: 'up', d: 'down', l: 'left', r: 'right', s: 'stay',
+    '上': 'up', '下': 'down', '左': 'left', '右': 'right', '停': 'stay'
+  };
+  function parseDsl(text) {
+    const out = new Map();
+    let seq = 0;
+    const lines = text.split(/\r?\n/);
+    for (let raw of lines) {
+      let line = raw.trim();
+      if (!line || line.startsWith('#')) continue;
+      let tick = seq;
+      const m = line.match(/^(\d+)\s*[:：]\s*(.*)$/);
+      if (m) { tick = Number(m[1]); line = m[2]; }
+      seq++;
+      const entry = { tick: tick };
+      const am = line.match(/a\s*[=:]?\s*([a-z一-龥])/i);
+      const bm = line.match(/b\s*[=:]?\s*([a-z一-龥])/i);
+      const put = (ch, who) => {
+        const d = dirMap[String(ch).toLowerCase()];
+        if (!d) throw new Error('无法识别的指令字符: ' + ch);
+        entry[who] = d;
+      };
+      if (am || bm) {
+        if (am) put(am[1], 'a');
+        if (bm) put(bm[1], 'b');
+      } else {
+        const toks = line.replace(/[^a-zA-Z一-龥]/g, '').split('');
+        if (toks.length !== 2)
+          throw new Error('第 ' + (seq) + ' 行需要两个指令（A、B），如 RU：' + raw);
+        put(toks[0], 'a'); put(toks[1], 'b');
+      }
+      if (tick < 0 || tick >= C.MAX_TICKS) throw new Error('tick 越界: ' + tick);
+      out.set(tick, Object.assign(out.get(tick) || {}, entry));
+    }
+    const length = out.size ? Math.max(...out.keys()) + 1 : 0;
+    return { entries: Array.from(out.values()), length: length };
+  }
+
+  function dslLoad(append) {
+    try {
+      const { entries, length } = parseDsl($('dsl').value);
+      let list, total;
+      if (append) {
+        list = cmds.slice();
+        total = client.result.length;
+        for (const e of entries) {
+          const t = total + e.tick;
+          if (t >= C.MAX_TICKS) break;
+          list[t] = { a: e.a, b: e.b };
+          total = Math.max(total, t + 1);
+        }
+      } else {
+        list = new Array(length);
+        for (const e of entries) list[e.tick] = { a: e.a, b: e.b };
+        total = length;
+      }
+      sendReset(list, total);
+    } catch (e) { alert('DSL 解析失败：' + e.message); }
+  }
+  $('dslImport').addEventListener('click', () => dslLoad(false));
+  $('dslAppend').addEventListener('click', () => dslLoad(true));
+
+  $('bExport').addEventListener('click', () => {
+    const r = client.result;
+    const payload = {
+      format: 'grid-replay', version: 1, grid: G,
+      length: r.length,
+      commands: Array.from({ length: r.length }, (_, t) => cmds[t] || null),
+      frames: r.frames
+    };
+    const blob = new Blob([JSON.stringify(payload)], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'replay-' + r.length + 't-' + new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-') + '.json';
+    a.click();
+    URL.revokeObjectURL(a.href);
+  });
+  $('bImport').addEventListener('click', () => $('fileImport').click());
+  $('fileImport').addEventListener('change', function () {
+    const f = this.files[0]; if (!f) return;
+    const rd = new FileReader();
+    rd.onload = () => {
+      try {
+        const j = JSON.parse(rd.result);
+        if (j.format !== 'grid-replay' || !Array.isArray(j.commands))
+          throw new Error('不是本回放器导出的 JSON');
+        const list = j.commands.map((c) => c || null);
+        sendReset(list, j.length);
+      } catch (e) { alert('导入失败：' + e.message); }
+      this.value = '';
+    };
+    rd.readAsText(f);
+  });
+  $('bResetDemo').addEventListener('click', () => sendReset(demoCommands, demoCommands.length));
+  $('bWipe').addEventListener('click', () => {
+    localStorage.removeItem(LS_KEY);
+    sendReset(demoCommands, demoCommands.length);
+  });
+
+  // ---------- 键盘快捷键 ----------
+  window.addEventListener('keydown', (e) => {
+    const tag = (e.target.tagName || '').toLowerCase();
+    if (tag === 'input' || tag === 'textarea' || tag === 'select') return;
+    if (e.key === ' ') { e.preventDefault(); $('bPlay').click(); }
+    else if (e.key === 'ArrowLeft') { cursor = Math.max(0, cursor - 1); renderAll(); }
+    else if (e.key === 'ArrowRight') { cursor = Math.min(client.result.length, cursor + 1); renderAll(); }
+    else if (e.key === 'Home') { cursor = 0; renderAll(); }
+    else if (e.key === 'End') { cursor = client.result.length; renderAll(); }
+  });
+  window.addEventListener('pagehide', persist);
+
+  // ---------- 启动：localStorage 存档优先，否则演示日志 ----------
+  function boot() {
+    let start = demoCommands, startLen = demoCommands.length;
+    try {
+      const saved = JSON.parse(localStorage.getItem(LS_KEY) || 'null');
+      if (saved && Array.isArray(saved.commands) && Number.isInteger(saved.length)) {
+        start = saved.commands.map((c) => c || null);
+        startLen = Math.min(saved.length, C.MAX_TICKS);
+      }
+    } catch (e) { /* 存档损坏则回退演示 */ }
+    sendReset(start, startLen);
+  }
+  boot();
+})();
+</script>
+</body>
+</html>
